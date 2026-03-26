@@ -14,6 +14,6 @@ This folder mirrors the three tasks required for the FIBIS assignment. Each sub-
 - ✔️ Ten FIBIS datasets saved under folders that precisely match the online titles.
 - ✔️ Automated pipelines for Tasks 2 and 3 with no manual transcription; notebooks document the execution path.
 - ✔️ Brief READMEs per task covering dataset choices, pagination/error tactics, parsing heuristics, and limitations.
-- ✔️ Output files present in their respective `output/` directories for quick verification.
+-  Output files present in their respective `output/` directories for quick verification.
 
 Use this folder as-is for submission (zip if required) to pass the evaluation without touching the working copies in the project root.
