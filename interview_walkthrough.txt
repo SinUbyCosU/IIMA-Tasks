@@ -1,0 +1,180 @@
+Task 1 · Historical Dataset Scraper
+=================================
+
+Overview
+--------
+- Goal: download ten archival tables (births, deaths, marriages, mutiny list) from the FIBIS search portal.
+- Challenge: interactive menus and pagination links can block bots; the script bypasses them with direct dataset URLs and polite retry logic.
+- Output: one CSV per dataset, saved inside folders that mirror the dataset name (e.g., "task 1/Overseas Births 1852/Overseas Births 1852.csv").
+
+Key Flow
+--------
+1. Iterate over the curated `DATASETS` list.
+2. For each dataset call `scrape_dataset()` which:
+   - Fetches the first page with `_fetch_with_retries()` (shared `requests.Session`, custom UA, exponential backoff).
+   - Parses the HTML with `pd.read_html` and `_extract_primary_table()` to keep the largest meaningful table while dropping "View"/"Unnamed" helper columns.
+   - Saves the table chunk and follows the "Next" link (via BeautifulSoup + `urljoin`) until pagination ends.
+   - Concatenates all chunks, removes all-null rows, and writes the final CSV.
+
+Representative Code
+-------------------
+```
+def scrape_dataset(dataset_name: str, start_url: str, output_root: Path = OUTPUT_ROOT, *, session=None, force=False) -> bool:
+    current_url = start_url
+    collected = []
+    safe_name = _sanitize_name(dataset_name)
+    session = session or requests.Session()
+    output_dir = output_root / dataset_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    file_path = output_dir / f"{safe_name}.csv"
+
+    if file_path.exists() and not force:
+        return True
+
+    while current_url:
+        response = _fetch_with_retries(session, current_url)
+        table = _extract_primary_table(response.text)
+        if table is None:
+            break
+        collected.append(table)
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        next_tag = soup.find("a", title="Next")
+        current_url = urljoin(BASE_URL, next_tag["href"]) if next_tag and next_tag.get("href") else None
+        time.sleep(1)
+
+    if not collected:
+        return False
+
+    final_df = pd.concat(collected, ignore_index=True).dropna(how="all")
+    final_df.to_csv(file_path, index=False)
+    return True
+```
+
+Interview Talking Points
+------------------------
+- Mention the explicit dataset whitelist that keeps scraping predictable and compliant.
+- Emphasize resilience: retry/backoff, caching (skipping finished datasets), and pagination awareness.
+- Suggest future tweaks (parallel downloads, schema normalization) to show forward thinking.
+
+
+Task 2 · PDF-to-Dataset Converter
+=================================
+
+Overview
+--------
+- Goal: turn the "History of Services" PDF into officer records with metadata (name, education, birth/join/arrival dates, domicile) plus multiple station postings.
+- Challenge: the PDF mixes narrative headers and multi-line tables with "Do." repeaters, fuzzy punctuation, and mis-OCRed dates.
+- Output: `task 2/output/task2_records.csv` + `.xlsx`, each row representing one station entry augmented with officer metadata.
+
+Key Flow
+--------
+1. `extract_rows()` loops through PDF pages (via pdfplumber) and keeps state for the current officer, table bounds, and the active row.
+2. Header detection: lines containing "Joined the service" (plus contextual punctuation) trigger `parse_header()`, which cleans the blob, extracts honorifics, splits name vs education, normalizes dates, and captures parenthetical vote/domicile info.
+3. Table parsing:
+   - `derive_column_bounds()` takes the "Station / Substantive / Date ..." header to build fixed-width slices (`ColumnBounds`).
+   - Each subsequent line is cut with `slice_columns()` and classified as a new row vs a wrapped continuation using `_has_digits` and non-empty station text.
+   - Repeated values like "Do." are resolved with `resolve_repeater()` using the last non-empty station/substantive/officiating strings.
+4. When a row completes, it is merged with the officer metadata and appended to the result list; the function finally converts all rows to a DataFrame and writes CSV/XLSX.
+
+Representative Code
+-------------------
+```
+def extract_rows(pdf_path: Path) -> List[Dict[str, Optional[str]]]:
+    rows = []
+    column_bounds = None
+    current_officer = None
+    current_row = None
+    last_station = last_substantive = last_off = ""
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            for line in (page.extract_text(layout=True) or "").splitlines():
+                normalized = line.rstrip("\n").replace("\u2002", " ")
+
+                if header_detected(normalized, previous_line):
+                    finalize_row(rows, current_row)
+                    current_officer = parse_header(" ".join(header_buffer_with_prev_line()))
+                    reset_repeaters()
+                    continue
+
+                if table_header_detected(normalized):
+                    column_bounds = derive_column_bounds(normalized)
+                    table_active = True
+                    continue
+
+                if not table_active or current_officer is None or column_bounds is None:
+                    continue
+
+                segments = slice_columns(normalized, column_bounds)
+                if is_new_row(segments):
+                    finalize_row(rows, current_row)
+                    current_row = build_row_template(current_officer)
+                    fill_new_row(current_row, segments, repeaters)
+                else:
+                    merge_wrapped_segments(current_row, segments, repeaters)
+```
+
+Interview Talking Points
+------------------------
+- Discuss how `_normalize_date()` converts noisy numeric strings into ISO dates with century inference (pivot logic) and why birth years use a different threshold.
+- Mention defensive coding around malformed headers (`try/except ValueError`) so one bad officer doesn’t stop the pipeline.
+- Highlight how the parser differentiates native table text vs wrapped fragments, keeping row integrity even when the PDF splits words with hyphens.
+
+
+Task 3 · OCR Matrimonial Ads
+=============================
+
+Overview
+--------
+- Goal: extract matrimonial classifieds from scanned newspaper PDFs (Times of India) and turn them into clean ad strings with metadata.
+- Challenge: heterogeneous scans—some pages have selectable text, others need OCR; ads are short, noisy, and interspersed with copyright notices.
+- Output: `task 3/output/task3_ads.csv` + `.xlsx`, each row containing ad id, source PDF, publication info, page label, and the consolidated ad text.
+
+Key Flow
+--------
+1. `main()` instantiates `OCRSettings`, chooses an OCR backend (`RapidOCR` default, Paddle optional), and iterates over every PDF in `task 3/Task 3/ad pdfs`.
+2. `extract_ads()` processes each page:
+   - Try `extract_native_page_text()` first; if the text layer exists and exceeds `native_min_chars`, reuse it (faster + more accurate).
+   - Otherwise render the page to PNG at 2× zoom (`fitz.Matrix`) and call `TextRecognizer.run()`.
+   - `layout_lines()` groups OCR boxes by Y coordinate tolerance so words on the same line concatenate left-to-right, then `clean_line()` normalizes quotes, hyphenation, and spacing.
+   - Filter out boilerplate using `NOISE_PATTERNS`.
+3. `segment_ads()` walks the cleaned lines, starting a new ad whenever one contains any `AD_KEYWORDS` (seeks, alliance, groom, etc.). It allows up to two grace lines without keywords to accommodate multi-sentence ads, flushes the buffer on blank lines, and deduplicates very short or repeated ads.
+4. `extract_metadata()` reads the PDF text once to infer publication name, date, and page code so every ad carries provenance.
+5. All ads are sorted by id, written to CSV/XLSX, and timing stats are printed.
+
+Representative Code
+-------------------
+```
+def extract_ads(pdf_path: Path, recognizer: TextRecognizer, settings: OCRSettings) -> List[str]:
+    doc = fitz.open(pdf_path)
+    lines = []
+    for index, page in enumerate(doc, start=1):
+        native_text = extract_native_page_text(page)
+        if native_text and is_useful_native_text(native_text, settings):
+            lines.append(native_text)
+            continue
+
+        png_bytes = render_page(page, settings.zoom)
+        result = recognizer.run(png_bytes)
+        if not result:
+            continue
+        for line in layout_lines(result, settings.y_tolerance):
+            if not is_noise(line):
+                lines.append(line)
+        print(f"    [OCR] {pdf_path.name} page {index}: {len(result)} boxes")
+    return segment_ads(lines)
+```
+
+Interview Talking Points
+------------------------
+- Explain why the pipeline prefers native text (accuracy + speed) yet gracefully falls back to OCR with tunable zoom and y-axis tolerance.
+- Describe the ad segmentation heuristic (keyword triggers + grace lines) and how it avoids boilerplate by filtering short/duplicate entries.
+- Mention extensibility: swapping OCR backends, adding language-specific stopwords, or enriching metadata extraction.
+
+
+How to Present This in the Interview
+====================================
+- Start with the objective/problem statement for each task, then walk through the pipeline stages while pointing to the code snippets above.
+- Mention resiliency, data-cleaning heuristics, and extensibility ideas to show depth.
+- Close each section with concrete outputs (CSV paths, row counts) and any lessons learned or future improvements.
